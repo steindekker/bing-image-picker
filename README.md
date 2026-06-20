@@ -4,7 +4,9 @@ An Anki add-on that adds a **🖼** button to the note editor. Press it to searc
 **Bing Images** for the note's word and pick from a 3×3 grid of thumbnails — the
 chosen image is downloaded into your collection and written to a field.
 
-![Screenshot](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" alt="Screenshot" width="400">
+</p>
 
 The first time you press 🖼 on a note type, a dialog asks which field to search
 from, which field to put the image in, and whether to append or overwrite.
