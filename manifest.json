@@ -1,4 +1,5 @@
 {
   "package": "bing_image_picker",
-  "name": "Bing Image Picker"
+  "name": "Bing Image Picker",
+  "min_point_version": 50
 }
