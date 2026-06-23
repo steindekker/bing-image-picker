@@ -10,7 +10,7 @@ The chosen image is saved to your collection and written to a field.
 </p>
 
 On first use per note type, a dialog asks which field to search from, which to put
-the image in, and append vs. overwrite.
+the image in, append vs. overwrite, and whether SafeSearch filters explicit results.
 
 The mapping is editable later via **Tools → Bing Image Picker**.
 
