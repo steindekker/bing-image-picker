@@ -33,8 +33,9 @@ from urllib.parse import quote, urlparse
 
 from aqt import gui_hooks, mw
 from aqt.qt import (
-    Qt, QAction, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout,
-    QHBoxLayout, QIcon, QLabel, QPixmap, QPushButton, QSize, QVBoxLayout, sip,
+    Qt, QAction, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QGridLayout, QHBoxLayout, QIcon, QLabel, QPixmap, QPushButton, QSize,
+    QVBoxLayout, sip,
 )
 from aqt.utils import showInfo
 
@@ -62,10 +63,11 @@ _BROWSER_HEADERS = {
     "Sec-CH-UA-Platform": '"Windows"',
 }
 _ASYNC_COUNT = 35
-_SEARCH_PAGE = "https://www.bing.com/images/search?q={q}&form=HDRSC2&adlt=off"
+# {adlt} is the SafeSearch level (off|strict), filled per request from config.
+_SEARCH_PAGE = "https://www.bing.com/images/search?q={q}&form=HDRSC2&adlt={adlt}"
 _WARM_PAGE = "https://www.bing.com/images/"     # query-less; pre-collects cookies
 _ASYNC_URL = ("https://www.bing.com/images/async?q={q}&first=0"
-              f"&count={_ASYNC_COUNT}&adlt=off&mmasync=1")
+              f"&count={_ASYNC_COUNT}" "&adlt={adlt}&mmasync=1")
 
 # The bot feed ignores `count` and returns far more than we asked for; treat a
 # wildly oversized batch as "blocked" rather than showing unrelated images.
@@ -90,6 +92,13 @@ def _config():
 
 def _save_config(cfg):
     mw.addonManager.writeConfig(__name__, cfg)
+
+
+def _adlt():
+    """Bing's SafeSearch level from config: "STRICT" when on, else "OFF". (The
+    setting is forced non-null before any search via _mapping_for.) Read on the UI
+    thread and threaded into the search so the worker never touches the manager."""
+    return "STRICT" if _config().get("safe_search") else "OFF"
 
 
 def _field_names(notetype):
@@ -135,10 +144,13 @@ class _ConfigDialog(QDialog):
         self.target = QComboBox()
         self.mode = QComboBox()
         self.mode.addItems(["Append", "Overwrite"])
+        self.safe = QCheckBox("Filter explicit results")   # global, not per note type
+        self.safe.setChecked(self.cfg.get("safe_search") is not False)   # on unless opted out
         form.addRow("Note type", self.nt)
         form.addRow("Search term from", self.source)
         form.addRow("Put image in", self.target)
         form.addRow("When adding", self.mode)
+        form.addRow("SafeSearch", self.safe)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -182,6 +194,7 @@ class _ConfigDialog(QDialog):
             "target": self.target.currentText(),
             "mode": "overwrite" if self.mode.currentText() == "Overwrite" else "append",
         }
+        self.cfg["safe_search"] = self.safe.isChecked()   # global; null until first saved
         _save_config(self.cfg)
         self.accept()
 
@@ -201,7 +214,7 @@ class _Candidate:
 
 
 def _cookie(name, value):
-    """A minimal .bing.com cookie for seeding the jar (used to force SafeSearch off)."""
+    """A minimal .bing.com cookie for seeding the jar (used to set SafeSearch)."""
     return Cookie(0, name, value, None, False, ".bing.com", True, True, "/", True,
                   False, None, False, None, None, {})
 
@@ -214,19 +227,20 @@ _session = None
 _session_lock = threading.Lock()
 
 
-def _new_session():
+def _new_session(adlt="OFF"):
     cj = CookieJar()
-    cj.set_cookie(_cookie("SRCHHPGUSR", "ADLT=OFF"))
+    cj.set_cookie(_cookie("SRCHHPGUSR", f"ADLT={adlt}"))
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj)), cj
 
 
-def _warm_session(term=None):
+def _warm_session(term=None, adlt="OFF"):
     """A fresh session with Bing's cookies collected by loading a real page: the
     query-less landing page for a generic pre-warm, or the term's own search page
     (so a later async Referer matches a page we actually loaded)."""
-    opener, cj = _new_session()
-    _get(opener, _SEARCH_PAGE.format(q=quote(term)) if term else _WARM_PAGE)
-    cj.set_cookie(_cookie("SRCHHPGUSR", "ADLT=OFF"))   # re-assert SafeSearch off
+    opener, cj = _new_session(adlt)
+    page = _SEARCH_PAGE.format(q=quote(term), adlt=adlt.lower()) if term else _WARM_PAGE
+    _get(opener, page)
+    cj.set_cookie(_cookie("SRCHHPGUSR", f"ADLT={adlt}"))   # re-assert SafeSearch level
     return opener, cj
 
 
@@ -292,19 +306,21 @@ def _parse(page):
     return out
 
 
-def _search(term):
+def _search(term, adlt="OFF"):
     """Image candidates from Bing's async results (one batch, ~35 — enough for
-    several pages of GRID). Reuses the shared pre-warmed session; on a block or
-    error, retries once with a fresh term-specific warm. Returns a list of
-    _Candidate, [] on nothing/failure, or the _BLOCKED sentinel if Bing served
-    its bot-detection fallback feed (so the picker can say so, not show junk)."""
+    several pages of GRID). `adlt` is the SafeSearch level ("OFF"|"STRICT").
+    Reuses the shared pre-warmed session; on a block or error, retries once with
+    a fresh term-specific warm. Returns a list of _Candidate, [] on
+    nothing/failure, or the _BLOCKED sentinel if Bing served its bot-detection
+    fallback feed (so the picker can say so, not show junk)."""
     q = quote(term)
-    async_url, referer = _ASYNC_URL.format(q=q), _SEARCH_PAGE.format(q=q)
+    async_url = _ASYNC_URL.format(q=q, adlt=adlt.lower())
+    referer = _SEARCH_PAGE.format(q=q, adlt=adlt.lower())
     blocked = False
     for fresh in (False, True):        # cached session first, then a fresh warm
         try:
-            opener, cj = _warm_session(term) if fresh else _ensure_session()
-            cj.set_cookie(_cookie("SRCHHPGUSR", "ADLT=OFF"))   # re-assert SafeSearch off
+            opener, cj = _warm_session(term, adlt) if fresh else _ensure_session()
+            cj.set_cookie(_cookie("SRCHHPGUSR", f"ADLT={adlt}"))   # re-assert SafeSearch
             cands = _parse(_get(opener, async_url, referer=referer))
         except Exception:
             _reset_session()
@@ -388,7 +404,8 @@ class _PickerDialog(QDialog):
 
         # Search runs first; thumbnails are then fetched in parallel and each slot
         # fills in as it arrives (rather than waiting for all of them serially).
-        _bg(lambda: _search(term), self._on_search)
+        adlt = _adlt()         # read config here, on the UI thread
+        _bg(lambda: _search(term, adlt), self._on_search)
 
     def done(self, r):  # marks the dialog closed so late thumbnail callbacks no-op
         self._closed = True
@@ -481,7 +498,11 @@ def _mapping_for(editor, note):
     cfg = _config()
     nt_cfg = cfg["notetypes"].get(name)
     fields = note.keys()
-    if not nt_cfg or nt_cfg.get("source") not in fields or nt_cfg.get("target") not in fields:
+    # Also force the dialog while SafeSearch is unchosen (null) — new note types,
+    # and existing users upgrading from before the setting existed, must pick once.
+    stale = (not nt_cfg or nt_cfg.get("source") not in fields
+             or nt_cfg.get("target") not in fields)
+    if stale or cfg.get("safe_search") is None:
         if not _ConfigDialog(editor.parentWindow, select_name=name).exec():
             return None
         nt_cfg = _config()["notetypes"].get(name)
