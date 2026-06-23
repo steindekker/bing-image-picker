@@ -9,22 +9,26 @@ on a note type, a small dialog asks which field to search from, which field to p
 the image in, and whether to append or overwrite. Mappings are editable later via
 Tools → Bing Image Picker (or the add-on's Config button).
 
-Self-contained: bundled Python + urllib only, no extra deps. Results are scraped
-from Bing's `/images/async` results fragment (each result is an `m=` attribute
-holding JSON with the thumbnail `turl` + source `murl`). The async endpoint is
-used, not the main search page: the latter returns the full grid only ~1 request
-in 4 (otherwise a JS-streamed shell with a single result), while async returns a
-full, stable batch every time. A desktop UA + SafeSearch-off cookie are needed for
-real (e.g. Japanese) results.
+Self-contained: bundled Python + urllib only, no extra deps. Each search warms a
+session on the main image-search page (to collect Bing's cookies), then scrapes
+its `/images/async` results fragment (each result is an `m=` attribute holding
+JSON with the thumbnail `turl` + source `murl`). The warm session + a full browser
+header set + a Referer are what keep Bing from serving its bot-detection fallback
+feed of unrelated images on lower-reputation networks; if it does anyway (that feed
+ignores the query and is oversized), the picker says so instead of showing junk.
 """
 from __future__ import annotations
 
+import gzip
 import html as _html
 import json
 import re
+import threading
 import time
 import urllib.request
+import zlib
 from dataclasses import dataclass
+from http.cookiejar import Cookie, CookieJar
 from urllib.parse import quote, urlparse
 
 from aqt import gui_hooks, mw
@@ -37,15 +41,37 @@ from aqt.utils import showInfo
 GRID = 9                       # 3×3
 THUMB = 160
 
-# A real desktop UA is REQUIRED: with a default/bot UA Bing serves an unrelated
-# default feed for Japanese terms. The cookie turns SafeSearch off (single user —
-# unfiltered results wanted; the adlt URL param alone is only advisory).
+# Bing's /images/async has two response modes. For a request it trusts as a real
+# browser it returns results for the query; for one it flags as a bot it silently
+# returns a query-INDEPENDENT default feed (~100 unrelated images) instead of a
+# 403. A desktop UA alone clears the bar on clean residential IPs, but on
+# lower-reputation networks (VPN, datacenter, CGNAT, some regions) Bing escalates
+# to checking browser-consistency signals — so we mimic the real flow: warm a
+# session on the search page to collect cookies, then call async with those
+# cookies + a Referer + a full browser header set.
 _USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Language": "ja,en;q=0.8",
-            "Cookie": "SRCHHPGUSR=ADLT=OFF"}
-_SEARCH_URL = ("https://www.bing.com/images/async?q={q}"
-               "&first=0&count=35&adlt=off&mmasync=1")
+_BROWSER_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "ja,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",          # browsers never send "identity"
+    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+}
+_ASYNC_COUNT = 35
+_SEARCH_PAGE = "https://www.bing.com/images/search?q={q}&form=HDRSC2&adlt=off"
+_WARM_PAGE = "https://www.bing.com/images/"     # query-less; pre-collects cookies
+_ASYNC_URL = ("https://www.bing.com/images/async?q={q}&first=0"
+              f"&count={_ASYNC_COUNT}&adlt=off&mmasync=1")
+
+# The bot feed ignores `count` and returns far more than we asked for; treat a
+# wildly oversized batch as "blocked" rather than showing unrelated images.
+_BLOCKED_MIN = 60
+_BLOCKED = object()        # sentinel _search returns when Bing served the bot feed
+
 # Each result is an <a class="iusc" ... m="{…json…}">; the JSON is HTML-escaped.
 _M_ATTR = re.compile(r'\sm="(\{&quot;.*?&quot;\})"')
 
@@ -174,15 +200,84 @@ class _Candidate:
     full_url: str
 
 
-def _search(term):
-    """Image candidates scraped from Bing's async results, deduped (one full batch,
-    ~35 — enough for several pages of GRID in the picker)."""
-    try:
-        req = urllib.request.Request(_SEARCH_URL.format(q=quote(term)), headers=_HEADERS)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            page = r.read().decode("utf-8", "replace")
-    except Exception:
-        return []
+def _cookie(name, value):
+    """A minimal .bing.com cookie for seeding the jar (used to force SafeSearch off)."""
+    return Cookie(0, name, value, None, False, ".bing.com", True, True, "/", True,
+                  False, None, False, None, None, {})
+
+
+# A single warmed session (opener + its cookie jar) is reused across searches so
+# the cookie-collecting page load is paid once — pre-warmed in the background when
+# the editor first opens (see _add_button), not lazily on the first search. A
+# blocked or failed search drops it so the next attempt re-warms from scratch.
+_session = None
+_session_lock = threading.Lock()
+
+
+def _new_session():
+    cj = CookieJar()
+    cj.set_cookie(_cookie("SRCHHPGUSR", "ADLT=OFF"))
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj)), cj
+
+
+def _warm_session(term=None):
+    """A fresh session with Bing's cookies collected by loading a real page: the
+    query-less landing page for a generic pre-warm, or the term's own search page
+    (so a later async Referer matches a page we actually loaded)."""
+    opener, cj = _new_session()
+    _get(opener, _SEARCH_PAGE.format(q=quote(term)) if term else _WARM_PAGE)
+    cj.set_cookie(_cookie("SRCHHPGUSR", "ADLT=OFF"))   # re-assert SafeSearch off
+    return opener, cj
+
+
+def _ensure_session():
+    """The shared warmed session, warming it generically if not done yet. Network
+    runs under the lock so a search started during the pre-warm waits for it."""
+    global _session
+    with _session_lock:
+        if _session is None:
+            _session = _warm_session()
+        return _session
+
+
+def _set_session(sess):
+    global _session
+    with _session_lock:
+        _session = sess
+
+
+def _reset_session():
+    global _session
+    with _session_lock:
+        _session = None
+
+
+def _get(opener, url, referer=None, timeout=10):
+    """GET via the session opener with browser headers, gunzipping the response.
+    With `referer` the request is shaped like the page's XHR (Sec-Fetch cors);
+    without, like a top-level navigation."""
+    headers = dict(_BROWSER_HEADERS)
+    if referer:
+        headers.update({"Referer": referer, "X-Requested-With": "XMLHttpRequest",
+                        "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Dest": "empty"})
+    else:
+        headers.update({"Sec-Fetch-Site": "none", "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Dest": "document"})
+    with opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+        raw, enc = r.read(), r.headers.get("Content-Encoding", "")
+    if enc == "gzip":
+        raw = gzip.decompress(raw)
+    elif enc == "deflate":
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            raw = zlib.decompress(raw, -zlib.MAX_WBITS)   # raw (headerless) deflate
+    return raw.decode("utf-8", "replace")
+
+
+def _parse(page):
+    """_Candidates from an async results fragment, deduped on the full URL."""
     out, seen = [], set()
     for raw in _M_ATTR.findall(page):
         try:
@@ -195,6 +290,33 @@ def _search(term):
         seen.add(full)
         out.append(_Candidate(thumb_url=thumb, full_url=full))
     return out
+
+
+def _search(term):
+    """Image candidates from Bing's async results (one batch, ~35 — enough for
+    several pages of GRID). Reuses the shared pre-warmed session; on a block or
+    error, retries once with a fresh term-specific warm. Returns a list of
+    _Candidate, [] on nothing/failure, or the _BLOCKED sentinel if Bing served
+    its bot-detection fallback feed (so the picker can say so, not show junk)."""
+    q = quote(term)
+    async_url, referer = _ASYNC_URL.format(q=q), _SEARCH_PAGE.format(q=q)
+    blocked = False
+    for fresh in (False, True):        # cached session first, then a fresh warm
+        try:
+            opener, cj = _warm_session(term) if fresh else _ensure_session()
+            cj.set_cookie(_cookie("SRCHHPGUSR", "ADLT=OFF"))   # re-assert SafeSearch off
+            cands = _parse(_get(opener, async_url, referer=referer))
+        except Exception:
+            _reset_session()
+            continue
+        if cands and len(cands) < _BLOCKED_MIN:
+            if fresh:
+                _set_session((opener, cj))     # promote the working session for reuse
+            return cands
+        if cands:                              # oversized batch => the bot feed
+            blocked = True
+        _reset_session()                       # drop the stale/blocked session
+    return _BLOCKED if blocked else []
 
 
 def _fetch(url, timeout=10):
@@ -277,7 +399,12 @@ class _PickerDialog(QDialog):
         return max(1, -(-len(self.candidates) // GRID))   # ceil
 
     def _on_search(self, fut):
-        self.candidates = fut.result()
+        result = fut.result()
+        if result is _BLOCKED:
+            self.info.setText("Bing blocked this search (bot check).\n"
+                              "Wait a moment and try again.")
+            return
+        self.candidates = result
         if not self.candidates:
             self.info.setText("No images found.")
             return
@@ -388,7 +515,21 @@ def _open_picker(editor):
     _PickerDialog(editor.parentWindow, term, on_pick).exec()
 
 
+_prewarmed = False
+
+
+def _prewarm():
+    """Collect Bing's cookies in the background the first time an editor opens, so
+    the latency is paid before — not during — the user's first search."""
+    global _prewarmed
+    if _prewarmed:
+        return
+    _prewarmed = True
+    _bg(_ensure_session)
+
+
 def _add_button(buttons, editor):
+    _prewarm()
     buttons.append(editor.addButton(
         icon=None, cmd="bing_image_picker", func=_open_picker,
         tip="Bing image search (3×3 picker)", label="🖼"))
